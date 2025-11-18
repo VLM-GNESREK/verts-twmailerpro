@@ -8,93 +8,81 @@
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <signal.h>
+#include "Headers/common.h" // Gemeine Definitionen
 
-// Gleiche Definitionen wie im Client für Konsistenz
-#define USER_LEN 8
-#define SUBJECT_LEN 80
-#define LINE_LEN 1024
+// -=- Hilf-Methoden (File IO / String) -=-
 
-// Befehls-Konstanten
-#define CMD_SEND "SEND"
-#define CMD_LIST "LIST"
-#define CMD_READ "READ" 
-#define CMD_DEL "DEL"
-#define CMD_QUIT "QUIT"
-
-// Antwort-Konstanten
-#define RESP_OK "OK"
-#define RESP_ERR "ERR"
-
-int read_complete_line(int sock, char* buffer, int max_size) {
+int read_complete_line(int sock, char* buffer, int max_size) // Liest eine Zeile und überprüft, dass sie korrekt verarbeitet wird.
+{
     int bytes_read = 0;
     char c;
     
-    while (bytes_read < max_size - 1) {
-        if (read(sock, &c, 1) <= 0) {
+    while (bytes_read < max_size - 1) 
+    {
+        int n = read(sock, &c, 1);
+        if (n <= 0) 
+        {
             return -1; // Fehler oder Verbindung geschlossen
         }
-        if (c == '\n') {
-            break; // Zeilenende erreicht
-        }
+        if (c == '\n') break; // Zeilenende
         buffer[bytes_read++] = c;
     }
     buffer[bytes_read] = '\0';
     return bytes_read;
 }
 
-int create_user_folder(const char* username, const char* mail_dir) {
+int is_username_valid(const char* username)
+{
+    if(!username || strlen(username) > USER_LEN || strlen(username) == 0) return 0;
+    for(int i = 0; username[i]; i++)
+    {
+        if(!((username[i] >= 'a' && username[i] <= 'z') || 
+             (username[i] >= '0' && username[i] <= '9'))) return 0;
+    }
+    return 1;
+}
+
+int create_user_folder(const char* username, const char* mail_dir) 
+{
     char folder_path[256];
     snprintf(folder_path, sizeof(folder_path), "%s/%s", mail_dir, username);
     
     struct stat st = {0};
-    if (stat(folder_path, &st) == -1) {
-        if (mkdir(folder_path, 0700) == -1) {
+    if (stat(folder_path, &st) == -1) 
+    {
+        if (mkdir(folder_path, 0700) == -1) 
+        {
             return 0; // Fehler
         }
     }
     return 1; // Erfolg
 }
 
-int count_user_messages(const char* username, const char* mail_dir) {
+int count_user_messages(const char* username, const char* mail_dir) 
+{
     char folder_path[256];
     snprintf(folder_path, sizeof(folder_path), "%s/%s", mail_dir, username);
     
     DIR* folder = opendir(folder_path);
-    if (!folder) {
+    if (!folder) 
+    {
         return 0; // Keine Nachrichten
     }
     
     int message_count = 0;
     struct dirent* entry;
     
-    while ((entry = readdir(folder)) != NULL) {
-        if (strstr(entry->d_name, ".msg")) {
+    while ((entry = readdir(folder)) != NULL) 
+    {
+        if (strstr(entry->d_name, ".msg")) 
+        {
             message_count++;
         }
     }
     
     closedir(folder);
     return message_count;
-}
-
-int is_username_valid(const char* username)
-{
-    int len = strlen(username);
-
-    if(len == 0 || len > USER_LEN)
-    {
-        return 0;
-    }
-
-    for(int i = 0; i < len; i++)
-    {
-        char c = username[i];
-        if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
-        {
-            return 0;
-        }
-    }
-    return 1;
 }
 
 int compare_filenames_numerically(const void *a, const void *b)
@@ -178,32 +166,55 @@ void free_sorted_messages(char** filenames, int count)
     }
 }
 
-void process_send_command(int client_sock, const char* mail_dir) 
+// -=- Command Handler -=-
+
+int handle_login(int sock, char *out_username)
 {
-    char sender[USER_LEN + 2];
+    char ldap_user[LINE_LEN];
+    char ldap_pass[LINE_LEN];
+
+    if(read_complete_line(sock, ldap_user, sizeof(ldap_user)) <= 0) return 0;
+    if(read_complete_line(sock, ldap_pass, sizeof(ldap_pass)) <= 0) return 0;
+
+    /*
+        TODO: INSERT LDAP CHECK HERE
+        For today: We accept any user/pass as long as valid user format
+    */
+
+    if(is_username_valid(ldap_user))
+    {
+        strcpy(out_username, ldap_user);
+        write(sock, RESP_OK, strlen(RESP_OK));
+        write(sock, "\n", 1);
+        return 1;
+    }
+
+    write(sock, RESP_ERR, strlen(RESP_ERR));
+    write(sock, "\n", 1);
+    return 0;
+}
+
+void process_send_command(int client_sock, const char *mail_dir, const char *session_user) 
+{
     char receiver[USER_LEN + 2];
     char subject[SUBJECT_LEN + 2];
     char line_buffer[LINE_LEN];
+
+    if(read_complete_line(client_sock, receiver, sizeof(receiver)) <= 0 ||
+       read_complete_line(client_sock, subject, sizeof(subject)) <= 0) return;
+
     FILE* message_file = NULL; 
     int is_valid = 1; // Flag only after connection is established
-    
-    // Reads all headers
-    if (read_complete_line(client_sock, sender, sizeof(sender)) <= 0 ||
-        read_complete_line(client_sock, receiver, sizeof(receiver)) <= 0 ||
-        read_complete_line(client_sock, subject, sizeof(subject)) <= 0) 
-    {
-        return; 
-    }
 
     // validation
-    if (!is_username_valid(sender) || !is_username_valid(receiver)) 
+    if (!is_username_valid(session_user) || !is_username_valid(receiver)) 
     {
         printf("Ungültiger Benutzername empfangen. Nachricht wird verworfen.\n");
         is_valid = 0; 
     } 
     else 
     {
-        printf("Neue Nachricht: %s -> %s [%s]\n", sender, receiver, subject);
+        printf("Neue Nachricht: %s -> %s [%s]\n", session_user, receiver, subject);
     }
     
     if (is_valid) 
@@ -226,7 +237,7 @@ void process_send_command(int client_sock, const char* mail_dir)
             } 
             else 
             {
-                fprintf(message_file, "Sender: %s\n", sender);
+                fprintf(message_file, "Sender: %s\n", session_user);
                 fprintf(message_file, "Receiver: %s\n", receiver);
                 fprintf(message_file, "Subject: %s\n", subject);
                 fprintf(message_file, "\n");
@@ -237,21 +248,8 @@ void process_send_command(int client_sock, const char* mail_dir)
     
     while (1) 
     {
-        if (read_complete_line(client_sock, line_buffer, sizeof(line_buffer)) < 0) 
-        {
-            if (message_file) fclose(message_file); 
-            return; 
-        }
-        
-        if (strcmp(line_buffer, ".") == 0) 
-        {
-            break; 
-        }
-        
-        if (is_valid && message_file) 
-        {
-            fprintf(message_file, "%s\n", line_buffer);
-        }
+        if(read_complete_line(client_sock, line_buffer, sizeof(line_buffer)) < 0) return;
+        if(strcmp(line_buffer, ".") == 0) break;
     }
     
     if (is_valid && message_file) 
@@ -270,27 +268,12 @@ void process_send_command(int client_sock, const char* mail_dir)
     }
 }
 
-void process_list_command(int client_sock, const char* mail_dir) 
+void process_list_command(int client_sock, const char *mail_dir, const char *session_user) 
 {
-    char username[USER_LEN + 2];
-    
-    if (read_complete_line(client_sock, username, sizeof(username)) <= 0) 
-    {
-        write(client_sock, "0\n", 2);
-        return;
-    }
-
-    if (!is_username_valid(username)) 
-    {
-        printf("Ungültiger Benutzername für LIST: %s\n", username);
-        write(client_sock, "0\n", 2); 
-        return;
-    }
-    
-    printf("Nachrichten auflisten für: %s\n", username);
+    printf("Nachrichten auflisten für: %s\n", session_user);
     
     int message_count = 0;
-    char** sorted_files = get_sorted_messages(username, mail_dir, &message_count);
+    char **sorted_files = get_sorted_messages(session_user, mail_dir, &message_count);
     
     // Anzahl an Client senden
     char count_buffer[32];
@@ -302,8 +285,8 @@ void process_list_command(int client_sock, const char* mail_dir)
     if (message_count > 0 && sorted_files) 
     {
         char folder_path[256];
-        snprintf(folder_path, sizeof(folder_path), "%s/%s", mail_dir, username);
-            
+        snprintf(folder_path, sizeof(folder_path), "%s/%s", mail_dir, session_user);
+
         for (int i = 0; i < message_count; i++) 
         {
             char file_path[512];
@@ -337,36 +320,23 @@ void process_list_command(int client_sock, const char* mail_dir)
     free_sorted_messages(sorted_files, message_count);
 }
 
-/**
- * Verarbeitet den READ Befehl - Liest eine bestimmte Nachricht
- */
-void process_read_command(int client_sock, const char* mail_dir) 
+void process_read_command(int client_sock, const char *mail_dir, const char *session_user) 
 {
-    char username[USER_LEN + 2];
     char msg_number_str[32];
     int msg_number;
     
-    if (read_complete_line(client_sock, username, sizeof(username)) <= 0 ||
-        read_complete_line(client_sock, msg_number_str, sizeof(msg_number_str)) <= 0) 
+    if(read_complete_line(client_sock, msg_number_str, sizeof(msg_number_str)) <= 0)
     {
-        write(client_sock, RESP_ERR, strlen(RESP_ERR));
-        write(client_sock, "\n", 1);
-        return;
-    }
-
-    if (!is_username_valid(username)) 
-    {
-        printf("Ungültiger Benutzername für READ/DEL: %s\n", username);
         write(client_sock, RESP_ERR, strlen(RESP_ERR));
         write(client_sock, "\n", 1);
         return;
     }
     
     msg_number = atoi(msg_number_str);
-    printf("Nachricht lesen: User=%s, Nr=%d\n", username, msg_number);
+    printf("Nachricht lesen: User=%s, Nr=%d\n", session_user, msg_number);
     
     int message_count = 0;
-    char** sorted_files = get_sorted_messages(username, mail_dir, &message_count);
+    char** sorted_files = get_sorted_messages(session_user, mail_dir, &message_count);
     
     if (msg_number < 1 || msg_number > message_count || !sorted_files) 
     {
@@ -380,7 +350,7 @@ void process_read_command(int client_sock, const char* mail_dir)
     const char* filename_to_read = sorted_files[msg_number - 1];
     
     char file_path[256];
-    snprintf(file_path, sizeof(file_path), "%s/%s/%s", mail_dir, username, filename_to_read);
+    snprintf(file_path, sizeof(file_path), "%s/%s/%s", mail_dir, session_user, filename_to_read);
     
     FILE* message_file = fopen(file_path, "r");
     if (!message_file) 
@@ -408,36 +378,23 @@ void process_read_command(int client_sock, const char* mail_dir)
     free_sorted_messages(sorted_files, message_count);
 }
 
-/**
- * Verarbeitet den DEL Befehl - Löscht eine Nachricht
- */
-void process_delete_command(int client_sock, const char* mail_dir) 
+void process_delete_command(int client_sock, const char *mail_dir, const char *session_user) 
 {
-    char username[USER_LEN + 2];
     char msg_number_str[32];
     int msg_number;
     
-    if (read_complete_line(client_sock, username, sizeof(username)) <= 0 ||
-        read_complete_line(client_sock, msg_number_str, sizeof(msg_number_str)) <= 0) 
+    if(read_complete_line(client_sock, msg_number_str, sizeof(msg_number_str)) <= 0)
     {
-        write(client_sock, RESP_ERR, strlen(RESP_ERR));
-        write(client_sock, "\n", 1);
-        return;
-    }
-
-    if (!is_username_valid(username)) 
-    {
-        printf("Ungültiger Benutzername für READ/DEL: %s\n", username);
         write(client_sock, RESP_ERR, strlen(RESP_ERR));
         write(client_sock, "\n", 1);
         return;
     }
     
     msg_number = atoi(msg_number_str);
-    printf("Nachricht löschen: User=%s, Nr=%d\n", username, msg_number);
+    printf("Nachricht löschen: User=%s, Nr=%d\n", session_user, msg_number);
 
     int message_count = 0;
-    char** sorted_files = get_sorted_messages(username, mail_dir, &message_count);
+    char** sorted_files = get_sorted_messages(session_user, mail_dir, &message_count);
     
     if (msg_number < 1 || msg_number > message_count || !sorted_files) 
     {
@@ -451,7 +408,7 @@ void process_delete_command(int client_sock, const char* mail_dir)
     const char* filename_to_delete = sorted_files[msg_number - 1];
     
     char file_path[256];
-    snprintf(file_path, sizeof(file_path), "%s/%s/%s", mail_dir, username, filename_to_delete);
+    snprintf(file_path, sizeof(file_path), "%s/%s/%s", mail_dir, session_user, filename_to_delete);
     
     if (remove(file_path) == 0) 
     {
@@ -469,9 +426,74 @@ void process_delete_command(int client_sock, const char* mail_dir)
     free_sorted_messages(sorted_files, message_count);
 }
 
-int main(int argc, char *argv[]) {
+void handle_client(int client_socket, const char *mail_dir)
+{
+    char client_command[32];
+    char session_user[USER_LEN + 1] = "";
+    int is_logged_in = 0;
+
+    while(1)
+    {
+        if(read_complete_line(client_socket, client_command, sizeof(client_command)) <= 0) break;
+
+        printf("[Client %d] Command: %s\n", getpid(), client_command);
+
+        if(strcmp(client_command, CMD_LOGIN) == 0)
+        {
+            if(handle_login(client_socket, session_user))
+            {
+                is_logged_in = 1;
+                printf("[Client %d] User %s logged in.\n", getpid(), session_user);
+            }
+            else
+            {
+                printf("[Client %d] Login failed.\n", getpid());
+                // TODO: Add Attempt Counter here mby? Lockout on 3 as per req.
+            }
+        }
+        else if (strcmp(client_command, CMD_QUIT) == 0)
+        {
+            break;
+        }
+        else if (!is_logged_in)
+        {
+            write(client_socket, RESP_ERR, sizeof(RESP_ERR));
+            write(client_socket, "\n", 1);
+        }
+        else if (strcmp(client_command, CMD_SEND) == 0)
+        {
+            process_send_command(client_socket, mail_dir, session_user);
+        }
+        else if (strcmp(client_command, CMD_LIST) == 0)
+        {
+            process_list_command(client_socket, mail_dir, session_user);
+        }
+        else if (strcmp(client_command, CMD_READ) == 0)
+        {
+            process_read_command(client_socket, mail_dir, session_user);
+        }
+        else if (strcmp(client_command, CMD_DEL) == 0)
+        {
+            process_delete_command(client_socket, mail_dir, session_user);
+        }
+        else // Unbekannter Fehler
+        {
+            write(client_socket, RESP_ERR, sizeof(RESP_ERR));
+            write(client_socket, "\n", 1);
+        }
+    }
+
+    close(client_socket);
+    exit(0);
+}
+
+int main(int argc, char *argv[]) 
+{
+    
     // Parameter überprüfen
-    if (argc != 3) {
+
+    if (argc != 3) 
+    {
         printf("Verwendung: %s <Port> <Mail-Verzeichnis>\n", argv[0]);
         printf("Beispiel: %s 8080 mailspool\n", argv[0]);
         return 1;
@@ -479,59 +501,58 @@ int main(int argc, char *argv[]) {
     
     int port = atoi(argv[1]);
     char* mail_directory = argv[2];
-    
-    // Mail-Hauptverzeichnis erstellen
     mkdir(mail_directory, 0700);
     
+    signal(SIGCHLD, SIG_IGN);
+
     // Server-Socket erstellen
+
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in server_address;
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(port);
     server_address.sin_addr.s_addr = INADDR_ANY;
+
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
-    // Socket binden und auf Verbindungen warten
-    bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address));
+    if(bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0)
+    {
+        perror("Bind failed.");
+        return 1;
+    }
     listen(server_socket, 5);
     
-    printf("TW-Mailer Server gestartet auf Port %d\n", port);
+    printf("TW-Mailer Pro Server gestartet auf Port %d\n", port);
     printf("Mail-Verzeichnis: %s\n", mail_directory);
     printf("Warte auf Client-Verbindungen...\n");
     
     // Hauptschleife für Client-Verbindungen
-    while (1) {
-        int client_socket = accept(server_socket, NULL, NULL);
-        printf("\n--- Neue Client-Verbindung ---\n");
-        
-        char client_command[32];
-        
-        // Befehle vom Client verarbeiten
-        while (1) {
-            if (read_complete_line(client_socket, client_command, sizeof(client_command)) <= 0) {
-                break; // Verbindung beendet
-            }
-            
-            printf("Empfangener Befehl: %s\n", client_command);
-            
-            if (strcmp(client_command, CMD_SEND) == 0) {
-                process_send_command(client_socket, mail_directory);
-            } else if (strcmp(client_command, CMD_LIST) == 0) {
-                process_list_command(client_socket, mail_directory);
-            } else if (strcmp(client_command, CMD_READ) == 0) {
-                process_read_command(client_socket, mail_directory);
-            } else if (strcmp(client_command, CMD_DEL) == 0) {
-                process_delete_command(client_socket, mail_directory);
-            } else if (strcmp(client_command, CMD_QUIT) == 0) {
-                printf("Client beendet Verbindung\n");
-                break;
-            } else {
-                write(client_socket, RESP_ERR, strlen(RESP_ERR));
-                write(client_socket, "\n", 1);
-            }
+    while (1) 
+    {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+        if(client_socket < 0) continue;
+
+        pid_t pid = fork();
+
+        if(pid < 0)
+        {
+            perror("Fork failed.");
+            close(client_socket);
         }
-        
-        close(client_socket);
-        printf("--- Client-Verbindung geschlossen ---\n");
+        else if(pid == 0) // Child
+        {
+            printf("\n--- Neue Client-Verbindung ---\n");
+            close(server_socket);
+            handle_client(client_socket, mail_directory);
+            printf("--- Client-Verbindung geschlossen ---\n");
+        }
+        else // Parent
+        {
+            close(client_socket);
+        }
     }
     
     close(server_socket);
