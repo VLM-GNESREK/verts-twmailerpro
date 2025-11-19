@@ -6,10 +6,54 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <signal.h>
 #include "Headers/common.h" // Gemeine Definitionen
+#define LDAP_DEPRECATED 1
+#include <ldap.h>
+
+#define LDAP_URI     "ldap://ldap.technikum-wien.at:389"
+#define LDAP_BASE_DN "dc=technikum-wien,dc=at"
+
+#define BLACKLIST_FILE "blacklist.txt"
+#define BLACKLIST_DURATION 60
+
+int is_ip_blacklisted(const char *ip) {
+    FILE *f = fopen(BLACKLIST_FILE, "r");
+    if (!f) return 0;
+
+    char file_ip[64];
+    long until = 0;
+    long now = time(NULL);
+
+    while (fscanf(f, "%63s %ld", file_ip, &until) == 2) {
+        if (strcmp(file_ip, ip) == 0) {
+            if (now < until) {
+                fclose(f);
+                return 1;  // IP ist noch gesperrt
+            }
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+void add_ip_to_blacklist(const char *ip) {
+    FILE *f = fopen(BLACKLIST_FILE, "a");
+    if (!f) return;
+
+    long until = time(NULL) + BLACKLIST_DURATION;
+
+    fprintf(f, "%s %ld\n", ip, until);
+    fclose(f);
+
+    printf("[SERVER] Added IP %s to blacklist for %d seconds.\n",
+           ip, BLACKLIST_DURATION);
+}
 
 // -=- Hilf-Methoden (File IO / String) -=-
 
@@ -166,6 +210,68 @@ void free_sorted_messages(char** filenames, int count)
     }
 }
 
+// -=- LDAP Authentifizierung -=-
+int ldap_authenticate(const char *username, const char *password)
+{
+    printf("=== LDAP AUTH ===\n");
+    printf("Username: '%s'\n", username ? username : "(null)");
+    printf("Password length: %zu\n", password ? strlen(password) : 0);
+
+    if (!username || !password || strlen(username) == 0 || strlen(password) == 0) {
+        printf("LDAP: empty username or password\n");
+        return 0;
+    }
+
+    LDAP *ld = NULL;
+    int rc = ldap_initialize(&ld, LDAP_URI);
+    printf("LDAP initialize: %s\n", ldap_err2string(rc));
+    if (rc != LDAP_SUCCESS || !ld) {
+        return 0;
+    }
+
+    // LDAP Optionen setzen
+    int version = LDAP_VERSION3;
+    ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &version);
+    ldap_set_option(ld, LDAP_OPT_REFERRALS, LDAP_OPT_OFF);
+
+    // TLS starten
+    rc = ldap_start_tls_s(ld, NULL, NULL);
+    printf("LDAP start_tls: %s\n", ldap_err2string(rc));
+    if (rc != LDAP_SUCCESS) {
+        ldap_unbind_ext_s(ld, NULL, NULL);
+        return 0;
+    }
+
+    // DN konstruieren 
+    char user_dn[256];
+    snprintf(user_dn, sizeof(user_dn),
+             "uid=%s,ou=people,dc=technikum-wien,dc=at",
+             username);
+
+    printf("Binding with DN: %s\n", user_dn);
+
+    // Simple SASL Bind (wie im Unterricht)
+    struct berval cred;
+    cred.bv_val = (char *)password;
+    cred.bv_len = strlen(password);
+
+    rc = ldap_sasl_bind_s(
+        ld,
+        user_dn,
+        LDAP_SASL_SIMPLE,
+        &cred,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    printf("LDAP bind result: %s\n", ldap_err2string(rc));
+
+    ldap_unbind_ext_s(ld, NULL, NULL);
+
+    return (rc == LDAP_SUCCESS);
+}
+
 // -=- Command Handler -=-
 
 int handle_login(int sock, char *out_username)
@@ -176,22 +282,23 @@ int handle_login(int sock, char *out_username)
     if(read_complete_line(sock, ldap_user, sizeof(ldap_user)) <= 0) return 0;
     if(read_complete_line(sock, ldap_pass, sizeof(ldap_pass)) <= 0) return 0;
 
-    /*
-        TODO: INSERT LDAP CHECK HERE
-        For today: We accept any user/pass as long as valid user format
-    */
-
-    if(is_username_valid(ldap_user))
+    if(!is_username_valid(ldap_user))
     {
-        strcpy(out_username, ldap_user);
-        write(sock, RESP_OK, strlen(RESP_OK));
+        write(sock, RESP_ERR, strlen(RESP_ERR));
         write(sock, "\n", 1);
-        return 1;
+        return 0;
     }
 
-    write(sock, RESP_ERR, strlen(RESP_ERR));
+      if (!ldap_authenticate(ldap_user, ldap_pass)) {
+        write(sock, RESP_ERR, strlen(RESP_ERR));
+        write(sock, "\n", 1);
+        return 0;
+    }
+
+    strcpy(out_username, ldap_user);
+    write(sock, RESP_OK, strlen(RESP_OK));
     write(sock, "\n", 1);
-    return 0;
+    return 1;
 }
 
 void process_send_command(int client_sock, const char *mail_dir, const char *session_user) 
@@ -431,57 +538,112 @@ void process_delete_command(int client_sock, const char *mail_dir, const char *s
     free_sorted_messages(sorted_files, message_count);
 }
 
+// -=- Client Handler -=-
 void handle_client(int client_socket, const char *mail_dir)
 {
     char client_command[32];
     char session_user[USER_LEN + 1] = "";
     int is_logged_in = 0;
+    int failed_attempts = 0;   // Zähler pro Verbindung
 
-    while(1)
+    //IP-Adresse holen
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    getpeername(client_socket, (struct sockaddr*)&addr, &len);
+
+    char client_ip[32];
+    strcpy(client_ip, inet_ntoa(addr.sin_addr));
+
+    printf("[Client %d] Connected from IP: %s\n", getpid(), client_ip);
+
+    //BLACKLIST CHECK
+    if (is_ip_blacklisted(client_ip)) {
+        printf("[Client %d] IP %s is BLACKLISTED → terminating connection.\n", getpid(), client_ip);
+        write(client_socket, "ERR\n", 4);
+        close(client_socket);
+        exit(0);
+    }
+    
+    while (1)
     {
-        if(read_complete_line(client_socket, client_command, sizeof(client_command)) <= 0) break;
+        if (read_complete_line(client_socket, client_command, sizeof(client_command)) <= 0)
+            break;
 
         printf("[Client %d] Command: %s\n", getpid(), client_command);
 
-        if(strcmp(client_command, CMD_LOGIN) == 0)
+        // LOGIN
+        if (strcmp(client_command, CMD_LOGIN) == 0)
         {
-            if(handle_login(client_socket, session_user))
+            // Zu viele Fehlversuche → Verbindung beenden
+            if (failed_attempts >= 3)
+            {
+                 add_ip_to_blacklist(client_ip);
+                write(client_socket, RESP_ERR, strlen(RESP_ERR));
+                write(client_socket, "\n", 1);
+                printf("[Client %d] Too many failed attempts --> BLACKLISTED \n", getpid());
+                break;  
+            }
+
+            // Login ausführen
+            if (handle_login(client_socket, session_user))
             {
                 is_logged_in = 1;
+                failed_attempts = 0; // Reset bei Erfolg
                 printf("[Client %d] User %s logged in.\n", getpid(), session_user);
             }
             else
             {
-                printf("[Client %d] Login failed.\n", getpid());
-                // TODO: Add Attempt Counter here mby? Lockout on 3 as per req.
+                failed_attempts++;
+                printf("[Client %d] Login failed (%d/3).\n", getpid(), failed_attempts);
+
+                if (failed_attempts >= 3)
+                {
+                    add_ip_to_blacklist(client_ip);
+                    printf("[Client %d] BLACKLISTED: %s\n", getpid(), client_ip);
+                    break;
+                }
             }
         }
+
+        // QUIT
         else if (strcmp(client_command, CMD_QUIT) == 0)
         {
             break;
         }
+
+        // Alles andere REQUIRES LOGIN
         else if (!is_logged_in)
         {
             write(client_socket, RESP_ERR, strlen(RESP_ERR));
             write(client_socket, "\n", 1);
         }
+
+        // SEND
         else if (strcmp(client_command, CMD_SEND) == 0)
         {
             process_send_command(client_socket, mail_dir, session_user);
         }
+
+        // LIST
         else if (strcmp(client_command, CMD_LIST) == 0)
         {
             process_list_command(client_socket, mail_dir, session_user);
         }
+
+        // READ
         else if (strcmp(client_command, CMD_READ) == 0)
         {
             process_read_command(client_socket, mail_dir, session_user);
         }
+
+        // DELETE
         else if (strcmp(client_command, CMD_DEL) == 0)
         {
             process_delete_command(client_socket, mail_dir, session_user);
         }
-        else // Unbekannter Fehler
+
+        // Unbekannter Command
+        else
         {
             write(client_socket, RESP_ERR, strlen(RESP_ERR));
             write(client_socket, "\n", 1);
