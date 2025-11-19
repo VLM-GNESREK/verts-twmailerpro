@@ -250,6 +250,11 @@ void process_send_command(int client_sock, const char *mail_dir, const char *ses
     {
         if(read_complete_line(client_sock, line_buffer, sizeof(line_buffer)) < 0) return;
         if(strcmp(line_buffer, ".") == 0) break;
+
+        if (is_valid && message_file) 
+        {
+            fprintf(message_file, "%s\n", line_buffer);
+        }
     }
     
     if (is_valid && message_file) 
@@ -457,7 +462,7 @@ void handle_client(int client_socket, const char *mail_dir)
         }
         else if (!is_logged_in)
         {
-            write(client_socket, RESP_ERR, sizeof(RESP_ERR));
+            write(client_socket, RESP_ERR, strlen(RESP_ERR));
             write(client_socket, "\n", 1);
         }
         else if (strcmp(client_command, CMD_SEND) == 0)
@@ -478,7 +483,7 @@ void handle_client(int client_socket, const char *mail_dir)
         }
         else // Unbekannter Fehler
         {
-            write(client_socket, RESP_ERR, sizeof(RESP_ERR));
+            write(client_socket, RESP_ERR, strlen(RESP_ERR));
             write(client_socket, "\n", 1);
         }
     }

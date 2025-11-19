@@ -156,8 +156,8 @@ void send_message_to_server(int sock)
 
 void list_user_messages(int sock) 
 {   
-    printf("--- List Messages ---\n");
-    printf("Username: %s", session_user);
+    printf("--- Alle Nachrichten ---\n");
+    printf("Benutzername: %s", session_user);
     
     // Befehl an Server senden
 
@@ -170,7 +170,7 @@ void list_user_messages(int sock)
     read_server_line(sock, count_str, sizeof(count_str));
     int count = atoi(count_str);
     
-    printf("Found %d messages:\n", count);
+    printf("\n%d Nachrichten gefunden:\n", count);
     
     // Betreffzeilen lesen
 
